@@ -7,7 +7,7 @@
 ## 安装
 
 ```sh
-cargo install --path .
+cargo install siu-tui
 siu
 ```
 
