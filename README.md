@@ -2,7 +2,9 @@
 
 在终端里统一管理本机各 coding agent 的 **MCP servers** 和 **skills**：安装、更新、按 agent 开关、暂停、删除，并可在线搜索 [MCP Registry](https://registry.modelcontextprotocol.io) 与 [skills.sh](https://skills.sh)。
 
-设计参考 [magpie](https://github.com/yetone/magpie) 的 Library：一处维护，按各 agent 自己的格式写入它的配置。siu **只改动自己写入的内容**，配置文件里的注释、顺序和其它条目保持不变。
+一处维护，按各 agent 自己的格式写入它的配置。siu **只改动自己写入的内容**，配置文件里的注释、顺序和其它条目保持不变。
+
+<img src="docs/demo.png" alt="siu 的 Skills 标签页：按来源分组的 skills，以及 agent 中未被管理的条目" width="640">
 
 ## 安装
 
