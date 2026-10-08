@@ -106,6 +106,14 @@ fn wrap(s: &str, w: usize) -> Vec<String> {
     out
 }
 
+/// `wrap`, keeping a blank line as one.
+fn wrap_or_blank(w: usize) -> impl Fn(&str) -> Vec<String> {
+    move |s| {
+        let v = wrap(s, w);
+        if v.is_empty() { vec![String::new()] } else { v }
+    }
+}
+
 fn mask(key: &str, v: &str) -> String {
     let k = key.to_uppercase();
     let secret = ["KEY", "TOKEN", "SECRET", "PASS", "AUTH", "COOKIE"]
@@ -166,17 +174,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(Modal::Form(form)) => draw_form(f, app, form),
         Some(Modal::Picker(_)) => draw_picker(f, app),
         Some(Modal::Confirm(c)) => {
-            let body = Text::from(vec![
-                Line::from(c.body.clone()),
-                Line::raw(""),
-                Line::from(vec![
-                    Span::styled(" y ", Style::new().fg(t().on_accent).bg(t().accent)),
-                    Span::raw(" confirm   "),
-                    Span::styled("n", Style::new().bold()),
-                    Span::styled(" / esc  cancel", dim()),
-                ]),
-            ]);
-            let area = centered(f.area(), 64, body.height() as u16 + 4);
+            // the body's lines as wrapped in the dialog
+            const W: usize = 64 - 4;
+            let mut lines: Vec<Line> = c
+                .body
+                .lines()
+                .flat_map(wrap_or_blank(W))
+                .map(Line::from)
+                .collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled(" y ", Style::new().fg(t().on_accent).bg(t().accent)),
+                Span::raw(" confirm   "),
+                Span::styled("n", Style::new().bold()),
+                Span::styled(" / esc  cancel", dim()),
+            ]));
+            let body = Text::from(lines);
+            let area = centered(f.area(), W as u16 + 4, body.height() as u16 + 4);
             f.render_widget(Clear, area);
             f.render_widget(
                 Paragraph::new(body).wrap(Wrap { trim: false }).block(
@@ -296,6 +310,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ("n", "none"),
             ("esc", "back"),
         ],
+        (_, Tab::Skills, _) if matches!(app.current(), Some(Row::Group { .. })) => &[
+            ("⏎", "fold/unfold"),
+            ("←→", "fold/unfold"),
+            ("/", "filter"),
+            ("?", "help"),
+        ],
         (_, Tab::Skills, _) if matches!(app.current(), Some(Row::Found(_))) => {
             &[("⏎/i", "import"), ("/", "filter"), ("?", "help")]
         }
@@ -372,6 +392,20 @@ fn draw_library(f: &mut Frame, app: &mut App, area: Rect, kind: Kind) {
     let items: Vec<ListItem> = rows
         .iter()
         .map(|r| match r {
+            Row::Group { label, n, folded } => {
+                let n = n.to_string();
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if *folded { "▸ " } else { "▾ " },
+                        Style::new().fg(t().accent),
+                    ),
+                    Span::styled(
+                        fit(label, w.saturating_sub(n.width() + 3)),
+                        Style::new().fg(t().accent).bold(),
+                    ),
+                    Span::styled(format!(" {n}"), dim()),
+                ]))
+            }
             Row::Header => ListItem::new(Line::from(Span::styled(
                 "  found in agents · not managed by siu".to_string(),
                 dim().add_modifier(Modifier::ITALIC),
@@ -501,8 +535,62 @@ fn draw_library(f: &mut Frame, app: &mut App, area: Rect, kind: Kind) {
     match app.current() {
         Some(Row::Entry(name)) => draw_entry(f, app, right, kind, &name),
         Some(Row::Found(name)) => draw_found(f, app, right, kind, &name),
+        Some(Row::Group { label, folded, .. }) => draw_group(f, app, right, &label, folded),
         _ => f.render_widget(block("", false), right),
     }
+}
+
+/// A group of skills: what's in it, and how many agents have each.
+fn draw_group(f: &mut Frame, app: &App, area: Rect, label: &str, folded: bool) {
+    let skills: Vec<_> = app
+        .store
+        .lib
+        .skills
+        .iter()
+        .filter(|e| app.skill_group(e).1 == label)
+        .collect();
+    let paused = skills.iter().filter(|e| !e.enabled).count();
+    let mut lines = vec![Line::from(vec![
+        Span::raw(format!(
+            "{} skill{}",
+            skills.len(),
+            if skills.len() == 1 { "" } else { "s" }
+        )),
+        Span::styled(
+            if paused > 0 {
+                format!(" · {paused} paused")
+            } else {
+                String::new()
+            },
+            Style::new().fg(t().warn),
+        ),
+    ])];
+    lines.push(Line::raw(""));
+    let mut names: Vec<&str> = skills.iter().map(|e| e.name.as_str()).collect();
+    names.sort();
+    let w = area.width.saturating_sub(4) as usize;
+    for line in wrap(&names.join(", "), w) {
+        lines.push(Line::styled(line, dim()));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("⏎", Style::new().fg(t().accent)),
+        Span::styled(
+            if folded {
+                " show its skills"
+            } else {
+                " fold them away"
+            },
+            dim(),
+        ),
+    ]));
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            block(Line::from(format!(" {label} ")).bold(), false)
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        area,
+    );
 }
 
 fn kv(k: &str, v: impl Into<String>) -> Line<'static> {
@@ -1159,8 +1247,9 @@ fn draw_help(f: &mut Frame) {
                 ("a", "add (server, or skills from GitHub/folder)"),
                 ("e", "edit server"),
                 ("u / U", "update skill / all skills"),
-                ("d", "delete"),
+                ("d / D", "delete / remove everything"),
                 ("i", "import one found in an agent"),
+                ("⏎ / ← →", "fold or open a group of skills"),
                 ("/", "filter"),
             ],
         ),

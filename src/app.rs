@@ -2,7 +2,7 @@
 //! terminal, so tests drive it with key events and read the screen from a
 //! test backend.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use crate::agents::Env;
 use crate::cache;
 use crate::github::{self, Spec};
-use crate::library::{FoundServer, FoundSkill, Report, Source, Store, UpdateOutcome};
+use crate::library::{FoundServer, FoundSkill, Report, SkillEntry, Source, Store, UpdateOutcome};
 use crate::market::{self, MarketServer, MarketSkill};
 use crate::mcp::{Server, Transport};
 use crate::skills::{self, Found};
@@ -50,8 +50,40 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
     Entry(String),
+    /// Heads the skills from one place: how many the list shows, and
+    /// whether they're folded away under it.
+    Group {
+        label: String,
+        n: usize,
+        folded: bool,
+    },
     Header,
     Found(String),
+}
+
+impl Row {
+    fn selectable(&self) -> bool {
+        *self != Row::Header
+    }
+}
+
+/// A group of more skills than this starts folded.
+const FOLD_OVER: usize = 10;
+
+/// The selectable row nearest `i`, looking forward or back first.
+fn nearest(rows: &[Row], i: usize, forward: bool) -> usize {
+    let after = || (i..rows.len()).find(|&j| rows[j].selectable());
+    let before = || {
+        (0..=i.min(rows.len() - 1))
+            .rev()
+            .find(|&j| rows[j].selectable())
+    };
+    let found = if forward {
+        after().or_else(before)
+    } else {
+        before().or_else(after)
+    };
+    found.unwrap_or(i)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +225,8 @@ pub struct Picker {
 pub enum ConfirmAction {
     DeleteServer(String),
     DeleteSkill(String),
+    /// Every server or skill in the library.
+    DeleteAll(Kind),
     ImportSkill(String),
 }
 
@@ -303,6 +337,8 @@ pub struct App {
     pub agent_sel: usize,
     pub filter: [Input; 2],
     pub filtering: bool,
+    /// Groups of skills folded (true) or opened (false) by hand.
+    pub folds: BTreeMap<String, bool>,
     pub found_servers: Vec<FoundServer>,
     pub found_skills: Vec<FoundSkill>,
     pub discover: Discover,
@@ -336,6 +372,7 @@ impl App {
             agent_sel: 0,
             filter: [Input::default(), Input::default()],
             filtering: false,
+            folds: BTreeMap::new(),
             found_servers: vec![],
             found_skills: vec![],
             discover: Discover {
@@ -374,8 +411,11 @@ impl App {
             rx,
         };
         app.rescan();
-        app.clamp();
         let cache = app.cache_dir();
+        if let Some(c) = cache::read(&cache, "skill-folds", Duration::MAX) {
+            app.folds = c.data;
+        }
+        app.clamp();
         if let Some(c) = cache::read::<Vec<MarketSkill>>(&cache, "skills-popular", POPULAR_TTL) {
             app.discover.index = c.data;
             app.discover.index_fresh = c.fresh;
@@ -853,14 +893,32 @@ impl App {
                     .collect()
             }
             Kind::Skills => {
-                rows.extend(
-                    self.store
-                        .lib
-                        .skills
-                        .iter()
-                        .filter(|e| hit(&e.name) || hit(&e.description))
-                        .map(|e| Row::Entry(e.name.clone())),
-                );
+                // by where they came from, as magpie's Library shows them:
+                // headings only when there's more than one place; a filter
+                // shows every match, folded or not
+                let mut groups: BTreeMap<(u8, String), Vec<&SkillEntry>> = BTreeMap::new();
+                for e in &self.store.lib.skills {
+                    groups.entry(self.skill_group(e)).or_default().push(e);
+                }
+                let headed = groups.len() > 1;
+                for ((_, label), mut es) in groups {
+                    let folded = headed && q.is_empty() && self.folded(&label, es.len());
+                    es.retain(|e| hit(&e.name) || hit(&e.description) || hit(&label));
+                    if es.is_empty() {
+                        continue;
+                    }
+                    es.sort_by(|a, b| a.name.cmp(&b.name));
+                    if headed {
+                        rows.push(Row::Group {
+                            label,
+                            n: es.len(),
+                            folded,
+                        });
+                    }
+                    if !folded {
+                        rows.extend(es.into_iter().map(|e| Row::Entry(e.name.clone())));
+                    }
+                }
                 self.found_skills
                     .iter()
                     .filter(|f| hit(&f.name))
@@ -873,6 +931,53 @@ impl App {
             rows.extend(found.into_iter().map(Row::Found));
         }
         rows
+    }
+
+    /// Where a skill came from, as its group in the list: a GitHub
+    /// repository, the folder it sat in, or the agents it was imported
+    /// from; the first part orders the groups.
+    pub fn skill_group(&self, e: &SkillEntry) -> (u8, String) {
+        match &e.source {
+            Some(Source::Github { repo, .. }) => (0, repo.clone()),
+            Some(Source::Local { dir }) => (1, tilde(dir.parent().unwrap_or(dir), &self.env.home)),
+            None => (2, "imported from agents".into()),
+        }
+    }
+
+    fn folded(&self, label: &str, n: usize) -> bool {
+        self.folds.get(label).copied().unwrap_or(n > FOLD_OVER)
+    }
+
+    /// Folds or opens a group of skills, keeping the cursor on its heading.
+    fn fold(&mut self, label: &str, fold: bool) {
+        if !self.filter[Kind::Skills as usize].text.is_empty() {
+            self.notify(
+                ToastKind::Info,
+                "A filter shows every match — esc clears it",
+            );
+            return;
+        }
+        self.folds.insert(label.to_string(), fold);
+        cache::write(&self.cache_dir(), "skill-folds", &self.folds);
+        if let Some(i) = self
+            .rows(Kind::Skills)
+            .iter()
+            .position(|r| matches!(r, Row::Group { label: l, .. } if l == label))
+        {
+            self.sel[Kind::Skills as usize] = i;
+        }
+    }
+
+    /// The heading over the selected skill, when it has one.
+    fn group_above(&self) -> Option<String> {
+        let rows = self.rows(Kind::Skills);
+        rows[..=self.sel[Kind::Skills as usize].min(rows.len().checked_sub(1)?)]
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                Row::Group { label, .. } => Some(label.clone()),
+                _ => None,
+            })
     }
 
     pub fn kind(&self) -> Option<Kind> {
@@ -889,6 +994,20 @@ impl App {
     }
 
     fn select_name(&mut self, kind: Kind, name: &str) {
+        // a skill in a folded group: open the group to show it
+        let shown = |app: &Self| {
+            app.rows(kind)
+                .iter()
+                .any(|r| matches!(r, Row::Entry(n) if n == name))
+        };
+        if kind == Kind::Skills
+            && !shown(self)
+            && let Some(e) = self.store.skill(name)
+        {
+            let (_, label) = self.skill_group(e);
+            self.folds.insert(label, false);
+            cache::write(&self.cache_dir(), "skill-folds", &self.folds);
+        }
         if let Some(i) = self
             .rows(kind)
             .iter()
@@ -903,8 +1022,8 @@ impl App {
             let rows = self.rows(k);
             let i = &mut self.sel[k as usize];
             *i = (*i).min(rows.len().saturating_sub(1));
-            if rows.get(*i) == Some(&Row::Header) {
-                *i += 1;
+            if !rows.is_empty() {
+                *i = nearest(&rows, *i, true);
             }
         }
     }
@@ -915,18 +1034,8 @@ impl App {
         if rows.is_empty() {
             return;
         }
-        let mut i = self.sel[k as usize] as isize;
-        loop {
-            i = (i + d).clamp(0, rows.len() as isize - 1);
-            if rows[i as usize] != Row::Header {
-                break;
-            }
-            if i == 0 || i == rows.len() as isize - 1 {
-                i -= d.signum();
-                break;
-            }
-        }
-        self.sel[k as usize] = i as usize;
+        let i = (self.sel[k as usize] as isize + d).clamp(0, rows.len() as isize - 1);
+        self.sel[k as usize] = nearest(&rows, i as usize, d > 0);
     }
 
     /// The agents shown under an entry: every detected one that can take it.
@@ -1046,7 +1155,22 @@ impl App {
 
     fn on_list_key(&mut self, k: KeyEvent) {
         let kind = self.kind().unwrap();
+        if let Some(Row::Group { label, folded, .. }) = self.current() {
+            match k.code {
+                KeyCode::Enter | KeyCode::Char(' ') => return self.fold(&label, !folded),
+                KeyCode::Right | KeyCode::Char('l') => return self.fold(&label, false),
+                KeyCode::Left | KeyCode::Char('h') => return self.fold(&label, true),
+                _ => {}
+            }
+        }
         match k.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let (Kind::Skills, Some(Row::Entry(_))) = (kind, self.current())
+                    && let Some(label) = self.group_above()
+                {
+                    self.fold(&label, true);
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::PageDown => self.move_sel(10),
@@ -1113,6 +1237,7 @@ impl App {
                     }));
                 }
             }
+            KeyCode::Char('D') => self.confirm_delete_all(kind),
             KeyCode::Char('i') => {
                 if let Some(Row::Found(name)) = self.current() {
                     self.import(kind, &name);
@@ -1217,6 +1342,58 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Asks before taking everything of a kind out of the library, saying
+    /// which agents lose it.
+    fn confirm_delete_all(&mut self, kind: Kind) {
+        let (n, agents): (usize, BTreeSet<&String>) = match kind {
+            Kind::Mcp => (
+                self.store.lib.mcp.len(),
+                self.store.lib.mcp.iter().flat_map(|e| &e.agents).collect(),
+            ),
+            Kind::Skills => (
+                self.store.lib.skills.len(),
+                self.store
+                    .lib
+                    .skills
+                    .iter()
+                    .flat_map(|e| &e.agents)
+                    .collect(),
+            ),
+        };
+        if n == 0 {
+            let what = match kind {
+                Kind::Mcp => "servers",
+                Kind::Skills => "skills",
+            };
+            self.notify(ToastKind::Info, format!("No {what} to remove"));
+            return;
+        }
+        let names: Vec<&str> = agents
+            .iter()
+            .filter_map(|a| self.store.agent(a))
+            .map(|a| a.name)
+            .collect();
+        let taken = if names.is_empty() {
+            "They are taken out of the library; no agent has any of them.".to_string()
+        } else {
+            format!(
+                "They are taken out of the library and out of {}.",
+                names.join(", ")
+            )
+        };
+        let kept = match kind {
+            Kind::Mcp => "Servers your agents have that siu doesn't manage stay as they are.",
+            Kind::Skills => {
+                "Folders of your own they were installed from, and skills your agents have that siu doesn't manage, stay as they are."
+            }
+        };
+        self.modal = Some(Modal::Confirm(Confirm {
+            title: format!("Remove all {}?", things(kind, n)),
+            body: format!("{taken}\n{kept}"),
+            action: ConfirmAction::DeleteAll(kind),
+        }));
     }
 
     fn import(&mut self, kind: Kind, name: &str) {
@@ -1411,6 +1588,13 @@ impl App {
             }
             ConfirmAction::DeleteSkill(n) => {
                 self.store.remove_skill(n).map(|_| format!("Deleted {n}"))
+            }
+            ConfirmAction::DeleteAll(kind) => {
+                let n = match kind {
+                    Kind::Mcp => std::mem::take(&mut self.store.lib.mcp).len(),
+                    Kind::Skills => std::mem::take(&mut self.store.lib.skills).len(),
+                };
+                Ok(format!("Removed all {}", things(*kind, n)))
             }
             ConfirmAction::ImportSkill(n) => {
                 match self.found_skills.iter().find(|f| f.name == *n).cloned() {
@@ -1937,6 +2121,15 @@ impl App {
             }
         }
     }
+}
+
+/// "1 server", "3 skills".
+fn things(kind: Kind, n: usize) -> String {
+    let what = match kind {
+        Kind::Mcp => "server",
+        Kind::Skills => "skill",
+    };
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
 fn tree_key(repo: &str, reference: &str) -> String {
