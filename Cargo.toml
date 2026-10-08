@@ -16,4 +16,5 @@ tempfile = "3.27.0"
 terminal-colorsaurus = "1.0.3"
 toml_edit = "0.25.15"
 unicode-width = "0.2.2"
-ureq = "3.4.2"
+# socks-proxy: ALL_PROXY=socks5://… is read first; without it ureq goes direct
+ureq = { version = "3.4.2", features = ["socks-proxy"] }
