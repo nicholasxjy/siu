@@ -398,7 +398,13 @@ impl Store {
             if self.skill(&name).is_some() {
                 bail!("the library already has a skill called {name}");
             }
-            let dst = self.skill_dir(&name);
+            if names.contains(&name) {
+                bail!("two of the skills picked are called {name}");
+            }
+            names.push(name);
+        }
+        for (f, name) in found.iter().zip(&names) {
+            let dst = self.skill_dir(name);
             skills::replace_dir(&f.dir, &dst)?;
             self.lib.skills.push(SkillEntry {
                 name: name.clone(),
@@ -410,7 +416,6 @@ impl Store {
                 installed: now(),
                 updated: now(),
             });
-            names.push(name);
         }
         Ok(names)
     }

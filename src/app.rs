@@ -579,7 +579,10 @@ impl App {
             return;
         };
         let key = tree_key(&s.source, "HEAD");
-        if self.have_skill(&s).is_none() && !self.trees.contains_key(&key) {
+        if self.have_skill(&s).is_none()
+            && self.skill_name_taken(&s).is_none()
+            && !self.trees.contains_key(&key)
+        {
             self.request_tree(&s.source, "HEAD", None, false);
         }
     }
@@ -1561,16 +1564,23 @@ impl App {
                             && it.blocked.is_none()
                         {
                             it.checked = !it.checked;
+                            // Only one of several with a name can be had.
+                            if it.checked {
+                                let label = it.label.clone();
+                                for (i, o) in p.items.iter_mut().enumerate() {
+                                    o.checked &= i == p.sel || o.label != label;
+                                }
+                            }
                         }
                     }
                     KeyCode::Char('a') => {
-                        let all = p
-                            .items
-                            .iter()
-                            .filter(|i| i.blocked.is_none())
-                            .all(|i| i.checked);
+                        let open = p.items.iter().filter(|i| i.blocked.is_none());
+                        let all = open.clone().all(|i| {
+                            i.checked || open.clone().any(|o| o.checked && o.label == i.label)
+                        });
+                        let mut seen = HashSet::new();
                         for it in p.items.iter_mut().filter(|i| i.blocked.is_none()) {
-                            it.checked = !all;
+                            it.checked = !all && seen.insert(it.label.clone());
                         }
                     }
                     KeyCode::Enter => return self.picked(p),
@@ -1761,15 +1771,22 @@ impl App {
         guard: Option<Arc<TempDir>>,
         origin: SkillOrigin,
     ) {
+        let names: Vec<String> = found.iter().map(Found::name).collect();
         let items: Vec<PickItem> = found
             .iter()
-            .map(|f| {
-                let name = f.name();
-                let blocked = self.store.skill(&name).map(|_| "installed".to_string());
+            .zip(&names)
+            .map(|(f, name)| {
+                let blocked = self.store.skill(name).map(|_| "installed".to_string());
+                // Namesakes are told apart by where they are.
+                let detail = if names.iter().filter(|n| *n == name).count() > 1 {
+                    format!("{} · {}", f.path, f.meta.description)
+                } else {
+                    f.meta.description.clone()
+                };
                 PickItem {
                     checked: blocked.is_none() && found.len() == 1,
-                    label: name,
-                    detail: f.meta.description.clone(),
+                    label: name.clone(),
+                    detail,
                     blocked,
                 }
             })
@@ -2047,8 +2064,21 @@ impl App {
                 }
                 _ => false,
             })
-            .or_else(|| self.store.skill(&skills::sanitize(&m.skill_id)))
             .map(|s| s.name.clone())
+    }
+
+    /// Where the skill that already has this one's name came from, when it
+    /// isn't this one.
+    pub fn skill_name_taken(&self, m: &MarketSkill) -> Option<String> {
+        if self.have_skill(m).is_some() {
+            return None;
+        }
+        let s = self.store.skill(&skills::sanitize(&m.skill_id))?;
+        Some(
+            s.source
+                .as_ref()
+                .map_or("your agents".into(), Source::label),
+        )
     }
 
     fn install_selected(&mut self) {
@@ -2113,6 +2143,13 @@ impl App {
                     self.notify(
                         ToastKind::Info,
                         format!("Already installed as {have} — see the Skills tab"),
+                    );
+                    return;
+                }
+                if let Some(from) = self.skill_name_taken(&s) {
+                    self.notify(
+                        ToastKind::Info,
+                        format!("{} is taken by the one from {from}", s.skill_id),
                     );
                     return;
                 }
@@ -2276,6 +2313,43 @@ mod tests {
         assert!(app.busy.is_empty() && app.fetching.is_empty());
         assert!(app.store.skill("pdf").is_some() && app.store.skill("docx").is_some());
         assert!(d.path().join(".claude/skills/docx/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn a_namesake_from_another_repo_is_not_installed() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = app_in(d.path());
+        let (guard, root) = repo_tree();
+        app.trees.insert(
+            tree_key("anthropics/skills", "HEAD"),
+            Tree {
+                guard: Arc::new(guard),
+                root,
+                at: Instant::now(),
+            },
+        );
+        let other = MarketSkill {
+            source: "acme/skills".into(),
+            ..market("pdf")
+        };
+        app.discover.skills = vec![market("pdf"), other.clone()];
+        enter(&mut app);
+        assert_eq!(app.have_skill(&market("pdf")).as_deref(), Some("pdf"));
+        assert_eq!(app.have_skill(&other), None);
+
+        app.discover.sel[1] = 1;
+        enter(&mut app);
+        assert!(
+            app.busy.is_empty() && app.fetching.is_empty(),
+            "no download"
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("github.com/anthropics/skills")
+        );
     }
 
     #[test]

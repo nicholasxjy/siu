@@ -374,6 +374,47 @@ fn skills_from_a_folder_install_update_and_delete() {
 }
 
 #[test]
+fn skills_sharing_a_name_install_one_at_a_time() {
+    let mut t = T::new();
+    let src = t.home.join("my-skills");
+    skill_tree(&src.join("a"), &["pdf"]);
+    skill_tree(&src.join("b"), &["pdf"]);
+    skill_tree(&src, &["docx"]);
+    t.keys("2")
+        .keys("a")
+        .keys("~/my-skills")
+        .press(KeyCode::Enter);
+    let s = t.screen();
+    assert!(s.contains("a/pdf") && s.contains("b/pdf"), "{s}");
+
+    t.keys("a"); // all: one of each name
+    assert!(t.screen().contains("install 2"));
+    let picked = |t: &T| -> Vec<String> {
+        let Some(Modal::Picker(p)) = &t.app.modal else {
+            panic!("no picker")
+        };
+        p.items
+            .iter()
+            .filter(|i| i.checked)
+            .map(|i| i.label.clone())
+            .collect()
+    };
+    assert_eq!(picked(&t), ["pdf", "docx"]);
+
+    // picking the other pdf drops the first
+    t.press(KeyCode::Down).press(KeyCode::Char(' '));
+    assert!(t.screen().contains("install 2"));
+    t.press(KeyCode::Enter);
+    assert_eq!(t.toast(), "Installed pdf, docx → 2 agents");
+    let lib = t.app.store.skill_dir("pdf");
+    assert!(skills::links_to(&t.home.join(".claude/skills/pdf"), &lib));
+    let e = t.app.store.skill("pdf").unwrap();
+    assert!(
+        matches!(&e.source, Some(crate::library::Source::Local { dir }) if dir.ends_with("b/pdf"))
+    );
+}
+
+#[test]
 fn a_skill_already_in_an_agent_is_imported_after_confirming() {
     let mut t = T::new();
     skill_tree(&t.home.join(".claude/skills"), &["mine"]);

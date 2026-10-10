@@ -901,9 +901,10 @@ fn draw_discover(f: &mut Frame, app: &mut App, area: Rect) {
             .skills
             .iter()
             .map(|s| {
-                let have = app.have_skill(s).is_some();
-                let (mark, color) = if have {
+                let (mark, color) = if app.have_skill(s).is_some() {
                     ("✓ ", t().ok)
+                } else if app.skill_name_taken(s).is_some() {
+                    ("– ", t().muted)
                 } else if s.official {
                     ("★ ", t().muted)
                 } else {
@@ -1048,9 +1049,15 @@ fn draw_discover(f: &mut Frame, app: &mut App, area: Rect) {
                 lines.push(kv("installs", count(s.installs)));
                 lines.push(kv("skill", s.skill_id.clone()));
                 lines.push(Line::raw(""));
-                lines.push(match app.have_skill(s) {
-                    Some(n) => Line::styled(format!("✓ Installed as {n}"), Style::new().fg(t().ok)),
-                    None => {
+                lines.push(match (app.have_skill(s), app.skill_name_taken(s)) {
+                    (Some(n), _) => {
+                        Line::styled(format!("✓ Installed as {n}"), Style::new().fg(t().ok))
+                    }
+                    (None, Some(from)) => Line::styled(
+                        format!("– {} is taken by the one from {from}", s.skill_id),
+                        dim(),
+                    ),
+                    (None, None) => {
                         let n = app.store.default_skill_agents().len();
                         Line::from(vec![
                             Span::styled("⏎", Style::new().fg(t().accent)),
