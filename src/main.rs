@@ -28,7 +28,8 @@ Usage: siu [--help | --version]
 
 Keeps one library of MCP servers and skills in ~/.siu (or $SIU_HOME) and
 writes each into the agents you pick: Claude Code, Claude Desktop, Codex,
-Gemini CLI, OpenCode, Cursor, Copilot CLI, Droid and ~/.agents/skills.
+Gemini CLI, OpenCode, Cursor, Copilot CLI, Droid, Pi, Grok, Antigravity and
+~/.agents/skills.
 Colors follow the terminal's dark or light background; SIU_THEME=dark or
 SIU_THEME=light picks one. Press ? inside for keys, t to switch theme.";
 

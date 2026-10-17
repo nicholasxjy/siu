@@ -18,6 +18,12 @@ pub enum McpFormat {
     OpenCode,
     /// `mcpServers` with `type` local/http/sse and `tools` (Copilot CLI).
     Copilot,
+    /// `mcpServers` with a bare command or a streamable HTTP url (Pi).
+    Pi,
+    /// `[mcp_servers.<name>]` tables with `type = "sse"` for SSE (Grok).
+    Grok,
+    /// `mcpServers` with `serverUrl` for a remote server (Antigravity).
+    Antigravity,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +56,8 @@ pub struct Env {
     pub config: PathBuf,
     pub claude_dir: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
+    pub pi_dir: Option<PathBuf>,
+    pub grok_home: Option<PathBuf>,
 }
 
 impl Env {
@@ -64,6 +72,11 @@ impl Env {
         Env {
             claude_dir: var("CLAUDE_CONFIG_DIR"),
             codex_home: var("CODEX_HOME"),
+            pi_dir: var("PI_CODING_AGENT_DIR").map(|d| match d.strip_prefix("~") {
+                Ok(rest) => home.join(rest),
+                Err(_) => d,
+            }),
+            grok_home: var("GROK_HOME"),
             home,
             config,
         }
@@ -77,6 +90,8 @@ impl Env {
             config: home.join(".config"),
             claude_dir: None,
             codex_home: None,
+            pi_dir: None,
+            grok_home: None,
         }
     }
 }
@@ -102,6 +117,17 @@ pub fn all(env: &Env) -> Vec<Agent> {
     } else {
         opencode_dir.join("opencode.json")
     };
+    let pi_dir = env.pi_dir.clone().unwrap_or_else(|| h(".pi/agent"));
+    let grok_dir = env.grok_home.clone().unwrap_or_else(|| h(".grok"));
+    // Antigravity, the CLI (agy) and the app alike, reads its user-wide MCP
+    // servers and skills from ~/.gemini/config; either one's own folder says
+    // it is here
+    let agy_dir = h(".gemini/config");
+    let agy_home = [".gemini/antigravity-cli", ".gemini/antigravity"]
+        .map(h)
+        .into_iter()
+        .find(|d| d.is_dir())
+        .unwrap_or_else(|| agy_dir.clone());
     let desktop_dir = config.join("Claude");
     let mcp = |path: PathBuf, format| Some(McpFile { path, format });
     vec![
@@ -155,6 +181,27 @@ pub fn all(env: &Env) -> Vec<Agent> {
             skills: Some(h(".factory/skills")),
         },
         Agent {
+            id: "pi",
+            name: "Pi",
+            home: pi_dir.clone(),
+            mcp: mcp(pi_dir.join("mcp.json"), McpFormat::Pi),
+            skills: Some(pi_dir.join("skills")),
+        },
+        Agent {
+            id: "grok",
+            name: "Grok",
+            home: grok_dir.clone(),
+            mcp: mcp(grok_dir.join("config.toml"), McpFormat::Grok),
+            skills: Some(grok_dir.join("skills")),
+        },
+        Agent {
+            id: "antigravity",
+            name: "Antigravity",
+            home: agy_home,
+            mcp: mcp(agy_dir.join("mcp_config.json"), McpFormat::Antigravity),
+            skills: Some(agy_dir.join("skills")),
+        },
+        Agent {
             id: "claude-desktop",
             name: "Claude Desktop",
             home: desktop_dir.clone(),
@@ -172,4 +219,53 @@ pub fn all(env: &Env) -> Vec<Agent> {
             skills: Some(h(".agents/skills")),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn find<'a>(agents: &'a [Agent], id: &str) -> &'a Agent {
+        agents.iter().find(|a| a.id == id).unwrap()
+    }
+
+    #[test]
+    fn antigravity_is_found_by_either_app_and_keeps_its_files_in_config() {
+        let d = tempfile::tempdir().unwrap();
+        let env = Env::rooted(d.path());
+        assert!(!find(&all(&env), "antigravity").detected());
+        fs::create_dir_all(d.path().join(".gemini/antigravity")).unwrap();
+        let agents = all(&env);
+        let agy = find(&agents, "antigravity");
+        assert!(agy.detected());
+        assert_eq!(
+            agy.mcp.as_ref().unwrap().path,
+            d.path().join(".gemini/config/mcp_config.json")
+        );
+        assert_eq!(agy.skills, Some(d.path().join(".gemini/config/skills")));
+    }
+
+    #[test]
+    fn pi_and_grok_follow_their_variables() {
+        let d = tempfile::tempdir().unwrap();
+        let mut env = Env::rooted(d.path());
+        let agents = all(&env);
+        assert_eq!(
+            find(&agents, "pi").mcp.as_ref().unwrap().path,
+            d.path().join(".pi/agent/mcp.json")
+        );
+        assert_eq!(
+            find(&agents, "grok").mcp.as_ref().unwrap().path,
+            d.path().join(".grok/config.toml")
+        );
+        env.pi_dir = Some(d.path().join("pi"));
+        env.grok_home = Some(d.path().join("grok"));
+        let agents = all(&env);
+        assert_eq!(find(&agents, "pi").skills, Some(d.path().join("pi/skills")));
+        assert_eq!(
+            find(&agents, "grok").mcp.as_ref().unwrap().path,
+            d.path().join("grok/config.toml")
+        );
+    }
 }

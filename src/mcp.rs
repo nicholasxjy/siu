@@ -102,7 +102,7 @@ pub fn unsupported(format: McpFormat, s: &Server) -> Option<&'static str> {
         (McpFormat::Desktop, Transport::Http | Transport::Sse) => {
             Some("remote servers go in Connectors")
         }
-        (McpFormat::Codex, Transport::Sse) => Some("no SSE support"),
+        (McpFormat::Codex | McpFormat::Pi, Transport::Sse) => Some("no SSE support"),
         _ => None,
     }
 }
@@ -110,9 +110,14 @@ pub fn unsupported(format: McpFormat, s: &Server) -> Option<&'static str> {
 fn container_key(format: McpFormat) -> &'static str {
     match format {
         McpFormat::OpenCode => "mcp",
-        McpFormat::Codex => "mcp_servers",
+        McpFormat::Codex | McpFormat::Grok => "mcp_servers",
         _ => "mcpServers",
     }
+}
+
+/// Whether the agent's file is TOML rather than JSON.
+fn is_toml(format: McpFormat) -> bool {
+    matches!(format, McpFormat::Codex | McpFormat::Grok)
 }
 
 fn str_map(m: &BTreeMap<String, String>) -> Value {
@@ -172,7 +177,7 @@ pub fn encode(format: McpFormat, s: &Server) -> Value {
             }
             o.insert("enabled".into(), json!(true));
         }
-        McpFormat::Cursor | McpFormat::Desktop => {
+        McpFormat::Cursor | McpFormat::Desktop | McpFormat::Pi => {
             if s.remote() {
                 o.insert("url".into(), json!(s.url));
                 opt(&mut o, "headers", &s.headers);
@@ -194,6 +199,24 @@ pub fn encode(format: McpFormat, s: &Server) -> Value {
                 opt(&mut o, "env", &s.env);
             }
             o.insert("tools".into(), json!(["*"]));
+        }
+        McpFormat::Grok | McpFormat::Antigravity => {
+            if s.remote() {
+                let url = if format == McpFormat::Grok {
+                    "url"
+                } else {
+                    "serverUrl"
+                };
+                o.insert(url.into(), json!(s.url));
+                if s.transport == Transport::Sse {
+                    o.insert("type".into(), json!("sse"));
+                }
+                opt(&mut o, "headers", &s.headers);
+            } else {
+                o.insert("command".into(), json!(s.command));
+                o.insert("args".into(), json!(s.args));
+                opt(&mut o, "env", &s.env);
+            }
         }
         McpFormat::Codex => {
             if s.remote() {
@@ -301,8 +324,18 @@ pub fn decode(format: McpFormat, name: &str, v: &Value) -> Option<Server> {
                 remote(&mut s, Transport::Http, url, "http_headers");
             }
         }
-        McpFormat::Claude | McpFormat::Cursor | McpFormat::Desktop | McpFormat::Copilot => {
-            let url = get_str(m, "url");
+        McpFormat::Claude
+        | McpFormat::Cursor
+        | McpFormat::Desktop
+        | McpFormat::Copilot
+        | McpFormat::Pi
+        | McpFormat::Grok
+        | McpFormat::Antigravity => {
+            // Antigravity reads a plain url where there's no serverUrl
+            let mut url = get_str(m, "url");
+            if format == McpFormat::Antigravity && m.contains_key("serverUrl") {
+                url = get_str(m, "serverUrl");
+            }
             if url.is_empty() {
                 local(&mut s, "env");
             } else {
@@ -338,11 +371,11 @@ fn read_raw(file: &McpFile) -> Result<Vec<(String, Value)>> {
     let Some(text) = read_text(&file.path)? else {
         return Ok(vec![]);
     };
-    let entries = if file.format == McpFormat::Codex {
+    let entries = if is_toml(file.format) {
         let doc: toml_edit::DocumentMut = text
             .parse()
             .with_context(|| format!("{}", file.path.display()))?;
-        doc.get("mcp_servers")
+        doc.get(container_key(file.format))
             .and_then(|i| i.as_table_like())
             .map(|t| {
                 t.iter()
@@ -373,8 +406,8 @@ fn read_text(path: &Path) -> Result<Option<String>> {
 /// Nothing is written when nothing would change.
 pub fn write(file: &McpFile, put: &[&Server], remove: &[String]) -> Result<bool> {
     let text = read_text(&file.path)?;
-    let out = if file.format == McpFormat::Codex {
-        write_codex(text.as_deref().unwrap_or(""), put, remove)?
+    let out = if is_toml(file.format) {
+        write_toml(file.format, text.as_deref().unwrap_or(""), put, remove)?
     } else {
         write_json(file.format, text.as_deref(), put, remove)?
     };
@@ -434,22 +467,25 @@ fn write_json(
     Ok(Some(out))
 }
 
+/// The keys of an entry siu writes; every other key is the user's.
+const MANAGED: &[&str] = &[
+    "type",
+    "url",
+    "httpUrl",
+    "serverUrl",
+    "headers",
+    "http_headers",
+    "command",
+    "args",
+    "env",
+    "environment",
+];
+
 /// The entry for `s`, keeping keys siu doesn't manage (timeouts, `disabled`,
 /// trust settings) from the entry already there.
 fn merged(format: McpFormat, old: Option<&Value>, s: &Server) -> Value {
     let mut new = encode(format, s);
     if let (Some(Value::Object(old)), Value::Object(n)) = (old, &mut new) {
-        const MANAGED: &[&str] = &[
-            "type",
-            "url",
-            "httpUrl",
-            "headers",
-            "http_headers",
-            "command",
-            "args",
-            "env",
-            "environment",
-        ];
         for (k, v) in old {
             if !MANAGED.contains(&k.as_str()) && !n.contains_key(k) {
                 n.insert(k.clone(), v.clone());
@@ -459,7 +495,12 @@ fn merged(format: McpFormat, old: Option<&Value>, s: &Server) -> Value {
     new
 }
 
-fn write_codex(text: &str, put: &[&Server], remove: &[String]) -> Result<Option<String>> {
+fn write_toml(
+    format: McpFormat,
+    text: &str,
+    put: &[&Server],
+    remove: &[String],
+) -> Result<Option<String>> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     let before = doc.to_string();
     if !doc.contains_key("mcp_servers") {
@@ -475,7 +516,7 @@ fn write_codex(text: &str, put: &[&Server], remove: &[String]) -> Result<Option<
         .ok_or_else(|| anyhow!("mcp_servers isn't a table"))?;
     for s in put {
         let old = servers.get(&s.name).map(toml_to_json);
-        let want = merged(McpFormat::Codex, old.as_ref(), s);
+        let want = merged(format, old.as_ref(), s);
         if old.as_ref() == Some(&want) {
             continue;
         }
@@ -484,7 +525,7 @@ fn write_codex(text: &str, put: &[&Server], remove: &[String]) -> Result<Option<
             .and_then(|i| i.as_table().cloned())
             .unwrap_or_default();
         // replace the managed keys, keep the others where they are
-        for k in ["url", "http_headers", "command", "args", "env"] {
+        for k in MANAGED {
             t.remove(k);
         }
         if let Value::Object(o) = &want {
@@ -695,7 +736,7 @@ mod tests {
         }
     }
 
-    const ALL: [McpFormat; 7] = [
+    const ALL: [McpFormat; 10] = [
         McpFormat::Claude,
         McpFormat::Cursor,
         McpFormat::Desktop,
@@ -703,6 +744,9 @@ mod tests {
         McpFormat::Gemini,
         McpFormat::OpenCode,
         McpFormat::Copilot,
+        McpFormat::Pi,
+        McpFormat::Grok,
+        McpFormat::Antigravity,
     ];
 
     #[test]
@@ -750,6 +794,78 @@ mod tests {
         assert!(unsupported(McpFormat::Desktop, &http()).is_some());
         assert!(unsupported(McpFormat::Codex, &sse()).is_some());
         assert!(unsupported(McpFormat::Codex, &http()).is_none());
+        assert!(unsupported(McpFormat::Pi, &sse()).is_some());
+        assert_eq!(
+            encode(McpFormat::Pi, &http()),
+            json!({"url": "https://mcp.example.com/mcp", "headers": {"Authorization": "Bearer t"}})
+        );
+        assert_eq!(
+            encode(McpFormat::Antigravity, &http())["serverUrl"],
+            "https://mcp.example.com/mcp"
+        );
+        assert!(
+            encode(McpFormat::Antigravity, &http())
+                .get("type")
+                .is_none()
+        );
+        assert_eq!(encode(McpFormat::Antigravity, &sse())["type"], "sse");
+        assert_eq!(encode(McpFormat::Grok, &sse())["type"], "sse");
+        assert_eq!(
+            encode(McpFormat::Grok, &http())["headers"]["Authorization"],
+            "Bearer t"
+        );
+        // agy reads a plain url too
+        let agy = decode(
+            McpFormat::Antigravity,
+            "a",
+            &json!({"url": "https://a.dev"}),
+        );
+        assert_eq!(agy.unwrap().transport, Transport::Http);
+    }
+
+    #[test]
+    fn grok_toml_reads_what_grok_writes_and_keeps_the_rest() {
+        let d = tempfile::tempdir().unwrap();
+        let f = file(d.path(), "config.toml", McpFormat::Grok);
+        // as `grok mcp add` writes them
+        fs::write(
+            &f.path,
+            "# mine\n[ui]\nyolo = false\n\n[mcp_servers.linear]\nurl = \"https://mcp.linear.app/sse\"\ntype = \"sse\"\nenabled = true\n\n[mcp_servers.api]\nurl = \"https://a.dev/mcp\"\nenabled = false\n\n[mcp_servers.api.headers]\nAuthorization = \"Bearer T\"\n",
+        )
+        .unwrap();
+        let servers = read(&f).unwrap();
+        assert_eq!(servers["linear"].transport, Transport::Sse);
+        assert_eq!(servers["api"].headers["Authorization"], "Bearer T");
+
+        let mut api = servers["api"].clone();
+        api.url = "https://b.dev/mcp".into();
+        write(&f, &[&api, &stdio()], &["linear".into()]).unwrap();
+        let text = fs::read_to_string(&f.path).unwrap();
+        assert!(text.starts_with("# mine\n[ui]\nyolo = false"), "{text}");
+        assert!(text.contains("enabled = false"), "{text}");
+        assert!(!text.contains("linear"), "{text}");
+        let servers = read(&f).unwrap();
+        assert_eq!(servers["api"].url, "https://b.dev/mcp");
+        assert_eq!(servers["api"].headers["Authorization"], "Bearer T");
+        assert_eq!(servers["fs"], stdio());
+        assert!(!write(&f, &[&api, &stdio()], &[]).unwrap());
+    }
+
+    #[test]
+    fn antigravity_update_from_sse_to_http_drops_the_type() {
+        let d = tempfile::tempdir().unwrap();
+        let f = file(d.path(), "mcp_config.json", McpFormat::Antigravity);
+        fs::write(
+            &f.path,
+            r#"{"mcpServers":{"ctx":{"type":"sse","serverUrl":"https://old.dev/sse","disabled":true}}}"#,
+        )
+        .unwrap();
+        write(&f, &[&http()], &[]).unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&f.path).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["ctx"],
+            json!({"serverUrl": "https://mcp.example.com/mcp", "headers": {"Authorization": "Bearer t"}, "disabled": true})
+        );
     }
 
     fn file(dir: &Path, name: &str, format: McpFormat) -> McpFile {

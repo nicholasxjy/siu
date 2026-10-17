@@ -826,6 +826,39 @@ mod tests {
     }
 
     #[test]
+    fn pi_grok_and_antigravity_get_servers_in_their_own_files() {
+        let mut f = fixture();
+        for dir in [".pi/agent", ".grok", ".gemini/antigravity-cli"] {
+            fs::create_dir_all(f.home.join(dir)).unwrap();
+        }
+        fs::write(f.home.join(".grok/config.toml"), "[ui]\nyolo = false\n").unwrap();
+        f.store = Store::open(&Env::rooted(&f.home), f.home.join(".siu")).unwrap();
+        let agents = f.store.default_server_agents(&ctx7());
+        for id in ["pi", "grok", "antigravity"] {
+            assert!(agents.contains(id), "{id}");
+        }
+        f.store.add_server(ctx7(), agents, None).unwrap();
+        let r = f.store.commit().unwrap();
+        assert!(r.issues.is_empty(), "{:?}", r.issues);
+        let json = |p: &str| -> Value {
+            serde_json::from_str(&fs::read_to_string(f.home.join(p)).unwrap()).unwrap()
+        };
+        assert_eq!(
+            json(".pi/agent/mcp.json")["mcpServers"]["ctx7"]["url"],
+            "https://mcp.context7.com/mcp"
+        );
+        assert_eq!(
+            json(".gemini/config/mcp_config.json")["mcpServers"]["ctx7"]["serverUrl"],
+            "https://mcp.context7.com/mcp"
+        );
+        let grok = fs::read_to_string(f.home.join(".grok/config.toml")).unwrap();
+        assert!(
+            grok.starts_with("[ui]\nyolo = false") && grok.contains("[mcp_servers.ctx7]"),
+            "{grok}"
+        );
+    }
+
+    #[test]
     fn existing_desktop_is_stdio_only() {
         let mut f = fixture();
         fs::create_dir_all(f.home.join(".config/Claude")).unwrap();

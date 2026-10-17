@@ -26,6 +26,9 @@ siu
 | Cursor | `~/.cursor/mcp.json` | `~/.cursor/skills` |
 | Copilot CLI | `~/.copilot/mcp-config.json` | `~/.copilot/skills` |
 | Droid | `~/.factory/mcp.json` | `~/.factory/skills` |
+| Pi | `~/.pi/agent/mcp.json`（遵循 `PI_CODING_AGENT_DIR`；无 SSE） | `~/.pi/agent/skills` |
+| Grok | `~/.grok/config.toml`（遵循 `GROK_HOME`） | `~/.grok/skills` |
+| Antigravity | `~/.gemini/config/mcp_config.json` | `~/.gemini/config/skills` |
 | Claude Desktop | `claude_desktop_config.json`（仅 stdio） | — |
 | 共享目录 | — | `~/.agents/skills` |
 
