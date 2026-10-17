@@ -13,6 +13,15 @@ cargo install siu-tui
 siu
 ```
 
+## 更新
+
+| 命令 | 作用 |
+| --- | --- |
+| `siu update` | 升级 siu 到 crates.io 上的最新版本（需要 cargo） |
+| `siu update --mcp` | 用 `npx` / `uvx` 运行的 server 固定到 npm / PyPI 上的最新版本，`docker` 镜像重新拉取；`@latest` 等 tag 或版本范围、远程 server 不改动 |
+| `siu update --skill` | 所有 skill 从其来源（GitHub 仓库或本地目录）更新 |
+| `siu update --all` | 以上全部 |
+
 ## 支持的 agent
 
 只显示本机已安装的。

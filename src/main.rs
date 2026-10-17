@@ -11,6 +11,7 @@ mod skills;
 mod tests;
 mod theme;
 mod ui;
+mod update;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,7 +25,13 @@ use crate::library::Store;
 
 const HELP: &str = "siu — manage your coding agents' MCP servers and skills
 
-Usage: siu [--help | --version]
+Usage: siu [update [--mcp] [--skill] [--all] | --help | --version]
+
+  update          install the newest siu from crates.io with cargo
+  update --mcp    move MCP servers run from npm or PyPI to their newest
+                  release and pull docker images
+  update --skill  refresh every skill from where it was installed from
+  update --all    all of the above
 
 Keeps one library of MCP servers and skills in ~/.siu (or $SIU_HOME) and
 writes each into the agents you pick: Claude Code, Claude Desktop, Codex,
@@ -49,6 +56,11 @@ fn main() -> Result<()> {
         Some("-V" | "--version") => {
             println!("siu {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
+        }
+        Some("update") => {
+            let env = Env::from_system();
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            return update::run(&args, &env, root(&env));
         }
         Some(other) => anyhow::bail!("unknown argument {other}; try --help"),
         None => {}
