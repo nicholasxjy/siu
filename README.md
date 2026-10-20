@@ -53,11 +53,22 @@ siu
 | `e` / `d` / `D` | 编辑 server / 删除 / 清空当前标签页（需确认） |
 | `u` / `U` | 更新当前 / 全部 skill |
 | `/` | 过滤 |
+| `E` / `I` | 导出 / 导入（恢复）整套配置的 JSON 备份 |
 | `t` | 切换深色 / 浅色主题 |
 
 - **分组**：skills 按来源分组（GitHub 仓库、本地目录、从 agent 导入）。超过 10 个的组默认折叠，在组标题上按 `⏎` 或 `←` / `→` 折叠和展开。
 - **导入**：列表下方 “found in agents” 是 agent 里已有、但不由 siu 管理的条目，按 `⏎` 导入。导入前 siu 不会改动它们。
 - **Discover**：`/` 搜索，`←` / `→` 切换 MCP 与 skills，`⏎` 安装到所有可用的 agent。
+
+## 备份与迁移
+
+`E` 把所有 MCP server、skills（连同文件内容）导出为一个 JSON 文件；`I` 选择这样的文件，确认替换范围后恢复。格式与 [siu-gui](https://github.com/nicholasxjy/siu-gui) 相同，两边导出的文件可以互相导入。
+
+- 恢复会用备份替换 siu 管理的全部 MCP 与 skills，并写入各 agent；agent 中不由 siu 管理的条目保持不变。恢复前的配置先备份到 `backups/config-*.json`。
+- 备份中的路径会从原机器的用户目录、数据目录换到本机对应位置。
+- 把导出的文件放到数据目录的 `config.json`，siu 启动或按 `r` 时会自动恢复；相同内容只应用一次（记录在 `config.applied.json`，与 siu-gui 共用）。
+- 备份中 siu-gui 的代理设置会写回 `proxy.json`；siu 自己仍按环境变量走代理。备份带有深色 / 浅色主题时，本次运行会随之切换（设置了 `SIU_THEME` 时以它为准）。
+- 文件包含 API key、请求头等凭据，以仅本人可读的权限写出，请妥善保管。server 需要的 Node、Python、Docker 等需在目标机器自行安装。
 
 ## 配置
 
@@ -71,7 +82,9 @@ siu
 
 - `library.json`：所有条目、各自开启的 agent，以及 siu 在每个 agent 中写入了什么
 - `skills/`：skill 文件；各 agent 中是指向这里的软链接，更新一次全部生效
-- `backups/`：首次修改配置前的原文件，以及导入 skill 时替换下来的目录
+- `backups/`：首次修改配置前的原文件、导入 skill 时替换下来的目录，以及恢复备份前的配置
+- `config.json`：可选，放入的备份会被自动恢复；`config.applied.json` 记录已恢复的内容
+- `proxy.json`：siu-gui 的代理设置，随备份导出和恢复
 - `cache/`：skills.sh 热门榜、skill 描述、分组折叠状态
 
 ## 开发

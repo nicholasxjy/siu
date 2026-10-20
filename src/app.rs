@@ -3,7 +3,7 @@
 //! test backend.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -12,13 +12,14 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tempfile::TempDir;
 
 use crate::agents::Env;
+use crate::backup::{self, Restored};
 use crate::cache;
 use crate::github::{self, Spec};
 use crate::library::{FoundServer, FoundSkill, Report, SkillEntry, Source, Store, UpdateOutcome};
 use crate::market::{self, MarketServer, MarketSkill};
 use crate::mcp::{Server, Transport};
 use crate::skills::{self, Found};
-use crate::theme::{Mode, Theme};
+use crate::theme::{self, Mode, Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -158,6 +159,8 @@ pub enum FormPurpose {
     EditServer(String),
     MarketInputs(Box<MarketServer>),
     AddSkills,
+    ExportConfig,
+    ImportConfig,
 }
 
 pub struct Form {
@@ -228,6 +231,13 @@ pub enum ConfirmAction {
     /// Every server or skill in the library.
     DeleteAll(Kind),
     ImportSkill(String),
+    /// Over a file that's already there.
+    ExportConfig(PathBuf),
+    /// The backup as it was previewed.
+    RestoreConfig {
+        path: PathBuf,
+        digest: String,
+    },
 }
 
 pub struct Confirm {
@@ -1111,6 +1121,14 @@ impl App {
                 self.reload();
                 return;
             }
+            KeyCode::Char('E') => {
+                self.open_config_form(FormPurpose::ExportConfig);
+                return;
+            }
+            KeyCode::Char('I') => {
+                self.open_config_form(FormPurpose::ImportConfig);
+                return;
+            }
             KeyCode::Char('t') => {
                 self.theme = self.theme.toggled();
                 let name = if self.theme.mode == Mode::Light {
@@ -1151,6 +1169,7 @@ impl App {
                 self.rescan();
                 self.clamp();
                 self.notify(ToastKind::Info, "Reloaded");
+                self.restore_config_json();
             }
             Err(e) => self.notify(ToastKind::Err, format!("{e:#}")),
         }
@@ -1606,6 +1625,17 @@ impl App {
                 };
                 Ok(format!("Removed all {}", things(*kind, n)))
             }
+            ConfirmAction::ExportConfig(path) => {
+                if let Err(e) = self.write_config(path) {
+                    self.notify(ToastKind::Err, e);
+                }
+                return;
+            }
+            ConfirmAction::RestoreConfig { path, digest } => {
+                let r = backup::import(&mut self.store, &self.env.home, path, digest);
+                self.restored(path, r);
+                return;
+            }
             ConfirmAction::ImportSkill(n) => {
                 match self.found_skills.iter().find(|f| f.name == *n).cloned() {
                     Some(f) => self
@@ -1648,6 +1678,8 @@ impl App {
                 }
             }
             FormPurpose::AddSkills => self.add_skills(f.fields[0].input.text.clone()),
+            FormPurpose::ExportConfig => self.export_config(&f.fields[0].input.text),
+            FormPurpose::ImportConfig => self.preview_config(&f.fields[0].input.text),
         };
         if let Err(e) = r {
             f.error = Some(e);
@@ -1702,6 +1734,170 @@ impl App {
         }
         self.select_name(Kind::Mcp, &s.name);
         Ok(())
+    }
+
+    // ---- backups ---------------------------------------------------------------
+
+    fn open_config_form(&mut self, purpose: FormPurpose) {
+        let (title, field) = match purpose {
+            FormPurpose::ExportConfig => (
+                "Export setup",
+                Field::text(
+                    "To",
+                    format!("~/siu-config-{}.json", date(crate::library::now())),
+                    "a .json file; it holds your API keys and tokens, keep it safe",
+                ),
+            ),
+            _ => (
+                "Restore setup",
+                Field::text("From", "", "a .json file exported by siu or siu-gui"),
+            ),
+        };
+        self.modal = Some(Modal::Form(Form {
+            title: title.into(),
+            fields: vec![field],
+            focus: 0,
+            purpose,
+            error: None,
+        }));
+    }
+
+    /// A path as typed: `~` is home, a relative one is from here.
+    fn typed_path(&self, s: &str) -> Result<PathBuf, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("a file is needed".into());
+        }
+        let p = match s.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                self.env.home.join(rest.trim_start_matches('/'))
+            }
+            _ => PathBuf::from(s),
+        };
+        if p.is_absolute() {
+            return Ok(p);
+        }
+        std::env::current_dir()
+            .map(|d| d.join(p))
+            .map_err(|e| format!("{e}"))
+    }
+
+    fn export_config(&mut self, to: &str) -> Result<(), String> {
+        let path = self.typed_path(to)?;
+        if path.is_file() {
+            self.modal = Some(Modal::Confirm(Confirm {
+                title: format!("Replace {}?", tilde(&path, &self.env.home)),
+                body: "It is overwritten with the current setup.".into(),
+                action: ConfirmAction::ExportConfig(path),
+            }));
+            return Ok(());
+        }
+        self.write_config(&path)
+    }
+
+    fn write_config(&mut self, path: &Path) -> Result<(), String> {
+        let done =
+            backup::export(&self.store, &self.env.home, path).map_err(|e| format!("{e:#}"))?;
+        self.notify(
+            ToastKind::Ok,
+            format!(
+                "Exported {} and {} to {} · it holds your API keys and tokens, keep it safe",
+                things(Kind::Mcp, done.mcp),
+                things(Kind::Skills, done.skills),
+                tilde(path, &self.env.home)
+            ),
+        );
+        Ok(())
+    }
+
+    /// Opens a backup and asks before restoring it, saying what changes.
+    fn preview_config(&mut self, from: &str) -> Result<(), String> {
+        let path = self.typed_path(from)?;
+        let p =
+            backup::preview(&self.store, &self.env.home, &path).map_err(|e| format!("{e:#}"))?;
+        let lib = &self.store.lib;
+        let mut body = format!(
+            "{}, exported {}.\n\
+             Now: {} and {} · backup: {} and {}.\n\
+             Every server and skill siu manages is replaced by the backup's and written into the agents it picks; what siu doesn't manage stays. siu-gui's proxy settings come along. The setup as it is now is saved to {} first.\n\
+             Node, Python, Docker or scripts the servers run still need installing here.",
+            tilde(&path, &self.env.home),
+            date(p.exported_at),
+            things(Kind::Mcp, lib.mcp.len()),
+            things(Kind::Skills, lib.skills.len()),
+            things(Kind::Mcp, p.mcp),
+            things(Kind::Skills, p.skills),
+            tilde(&self.store.root.join("backups"), &self.env.home),
+        );
+        if !p.issues.is_empty() {
+            body.push_str("\n\nWatch out:");
+            for issue in &p.issues {
+                body.push_str(&format!("\n• {issue}"));
+            }
+        }
+        self.modal = Some(Modal::Confirm(Confirm {
+            title: "Restore this backup?".into(),
+            body,
+            action: ConfirmAction::RestoreConfig {
+                path,
+                digest: p.digest,
+            },
+        }));
+        Ok(())
+    }
+
+    /// Restores `config.json` from the library folder when it's new: it's
+    /// how a setup is handed to siu (or siu-gui) on another machine.
+    pub fn restore_config_json(&mut self) {
+        let path = self.store.root.join("config.json");
+        if let Some(r) = backup::apply_default(&mut self.store, &self.env.home).transpose() {
+            self.restored(&path, r);
+        }
+    }
+
+    fn restored(&mut self, from: &Path, r: anyhow::Result<Restored>) {
+        self.rescan();
+        self.clamp();
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                return self.notify(
+                    ToastKind::Err,
+                    format!("{}: {e:#}", tilde(from, &self.env.home)),
+                );
+            }
+        };
+        // a theme the user set for siu outranks the backup's
+        let pinned = std::env::var("SIU_THEME")
+            .ok()
+            .as_deref()
+            .and_then(theme::parse_mode)
+            .is_some();
+        if let Some(mode) = r.theme.as_deref().and_then(theme::parse_mode)
+            && !pinned
+        {
+            self.theme = Theme::for_terminal(mode);
+        }
+        let what = format!(
+            "Restored {} and {} from {}",
+            things(Kind::Mcp, self.store.lib.mcp.len()),
+            things(Kind::Skills, self.store.lib.skills.len()),
+            tilde(from, &self.env.home)
+        );
+        if r.report.issues.is_empty() {
+            self.notify(
+                ToastKind::Ok,
+                format!(
+                    "{what} · the setup before is in {}",
+                    tilde(&r.saved, &self.env.home)
+                ),
+            );
+        } else {
+            self.notify(
+                ToastKind::Err,
+                format!("{what} · {}", r.report.issues.join(" · ")),
+            );
+        }
     }
 
     fn install_server(&mut self, s: Server, origin: String) {
@@ -2158,6 +2354,21 @@ impl App {
             }
         }
     }
+}
+
+/// A Unix time's day in UTC, as 2026-01-31.
+fn date(secs: u64) -> String {
+    // days to a civil date, after Howard Hinnant's algorithm
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// "1 server", "3 skills".

@@ -1,5 +1,6 @@
 mod agents;
 mod app;
+mod backup;
 mod cache;
 mod github;
 mod library;
@@ -70,6 +71,7 @@ fn main() -> Result<()> {
     let mut app = App::new(store, env);
     // asked of the terminal before the TUI takes its input over
     app.theme = theme::Theme::for_terminal(theme::detect());
+    app.restore_config_json();
     app.start();
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);

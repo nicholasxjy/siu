@@ -1242,6 +1242,7 @@ fn draw_help(f: &mut Frame) {
                 ("?", "this help"),
                 ("r", "reload from disk"),
                 ("t", "dark / light theme"),
+                ("E / I", "export / restore the setup as JSON"),
                 ("q / ctrl-c", "quit"),
             ],
         ),

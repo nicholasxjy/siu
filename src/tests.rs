@@ -651,6 +651,155 @@ fn library_persists_across_launches() {
     assert!(again.screen().contains("● keep"));
 }
 
+/// A server and two skills from a folder, as a setup to back up.
+fn set_up(t: &mut T) {
+    skill_tree(&t.home.join("my-skills"), &["pdf", "docx"]);
+    t.keys("a")
+        .keys("weather")
+        .press(KeyCode::Tab)
+        .press(KeyCode::Tab)
+        .keys("npx -y @acme/weather");
+    t.ctrl('s');
+    t.keys("2")
+        .keys("a")
+        .keys("~/my-skills")
+        .press(KeyCode::Enter)
+        .keys("a")
+        .press(KeyCode::Enter);
+    t.keys("1");
+    assert_eq!(t.app.store.lib.skills.len(), 2);
+}
+
+#[test]
+fn the_setup_is_exported_and_restored_on_another_machine() {
+    let mut a = T::new();
+    set_up(&mut a);
+    a.keys("E");
+    assert!(a.screen().contains("Export setup"));
+    a.ctrl('u').keys("~/setup.json").press(KeyCode::Enter);
+    assert!(a.app.modal.is_none());
+    assert!(
+        a.toast()
+            .starts_with("Exported 1 server and 2 skills to ~/setup.json"),
+        "{}",
+        a.toast()
+    );
+    let file = a.home.join("setup.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    // the same file again asks first
+    a.keys("E")
+        .ctrl('u')
+        .keys("~/setup.json")
+        .press(KeyCode::Enter);
+    assert!(a.screen().contains("Replace ~/setup.json?"));
+    a.keys("y");
+    assert!(a.toast().starts_with("Exported"), "{}", a.toast());
+
+    let mut b = T::new();
+    fs::copy(&file, b.home.join("in.json")).unwrap();
+    // a file that isn't there keeps the form open
+    b.keys("I").keys("~/nope.json").press(KeyCode::Enter);
+    assert!(matches!(b.app.modal, Some(Modal::Form(_))));
+    assert!(b.screen().contains("nope.json"));
+    b.ctrl('u').keys("~/in.json").press(KeyCode::Enter);
+    let s = b.screen();
+    assert!(
+        s.contains("Restore this backup?")
+            && s.contains("Now: 0 servers and 0 skills")
+            && s.contains("backup: 1 server and 2 skills"),
+        "{s}"
+    );
+    // n changes nothing
+    b.keys("n");
+    assert!(b.app.store.lib.mcp.is_empty());
+    b.keys("I")
+        .keys("~/in.json")
+        .press(KeyCode::Enter)
+        .keys("y");
+    assert!(
+        b.toast().starts_with(
+            "Restored 1 server and 2 skills from ~/in.json · the setup before is in ~/.siu/backups/config-"
+        ),
+        "{}",
+        b.toast()
+    );
+    let servers = &b.claude()["mcpServers"];
+    assert_eq!(servers["weather"]["command"], "npx");
+    assert!(
+        servers.get("mine").is_some(),
+        "the agent's own server stays"
+    );
+    assert!(b.codex().contains("[mcp_servers.weather]"));
+    let lib = b.app.store.skill_dir("pdf");
+    assert!(skills::links_to(&b.home.join(".claude/skills/pdf"), &lib));
+    assert!(lib.join("SKILL.md").is_file());
+    // a skill from a folder now points at that folder on this machine
+    let source = b.app.store.skill("pdf").unwrap().source.clone();
+    assert_eq!(
+        source,
+        Some(crate::library::Source::Local {
+            dir: b.home.join("my-skills/pdf")
+        })
+    );
+    assert!(b.screen().contains("● weather"));
+}
+
+#[test]
+fn config_json_in_the_library_is_restored_once_per_change() {
+    let mut a = T::new();
+    set_up(&mut a);
+    let mut b = T::new();
+    let config = b.home.join(".siu/config.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    crate::backup::export(&a.app.store, &a.home, &config).unwrap();
+
+    b.keys("r");
+    assert!(
+        b.toast()
+            .starts_with("Restored 1 server and 2 skills from ~/.siu/config.json"),
+        "{}",
+        b.toast()
+    );
+    assert!(b.home.join(".siu/config.applied.json").is_file());
+    assert!(b.claude()["mcpServers"].get("weather").is_some());
+
+    // applied once: deleting the server sticks across reloads
+    b.keys("g").keys("d").keys("y");
+    b.keys("r");
+    assert_eq!(b.toast(), "Reloaded");
+    assert!(b.app.store.lib.mcp.is_empty());
+
+    // a changed file applies again, siu-gui's proxy and theme with it
+    let mut backup: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    backup["theme"] = "light".into();
+    backup["proxy"] = serde_json::json!({"mode": "custom", "url": "http://127.0.0.1:7890", "noProxy": "localhost"});
+    fs::write(&config, serde_json::to_vec_pretty(&backup).unwrap()).unwrap();
+    b.keys("r");
+    assert!(b.toast().starts_with("Restored 1 server"), "{}", b.toast());
+    assert_eq!(b.app.store.lib.mcp.len(), 1);
+    let proxy: Value =
+        serde_json::from_slice(&fs::read(b.home.join(".siu/proxy.json")).unwrap()).unwrap();
+    assert_eq!(proxy["url"], "http://127.0.0.1:7890");
+    if std::env::var_os("SIU_THEME").is_none() {
+        assert_eq!(b.app.theme.mode, crate::theme::Mode::Light);
+    }
+
+    // one that can't be read says so and changes nothing
+    fs::write(&config, b"{}").unwrap();
+    b.keys("r");
+    assert!(
+        b.toast().contains("~/.siu/config.json") && b.toast().contains("isn't a siu backup"),
+        "{}",
+        b.toast()
+    );
+    assert_eq!(b.app.store.lib.mcp.len(), 1);
+}
+
 /// Against the real MCP Registry, skills.sh and GitHub:
 /// `cargo test -- --ignored online`.
 #[test]
